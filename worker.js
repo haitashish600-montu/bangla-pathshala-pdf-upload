@@ -3,10 +3,10 @@ const ALLOWED_ORIGINS = new Set([
   "null"
 ]);
 
-function corsHeaders(origin) {
+function corsHeaders(origin, requestedHeaders = "") {
   const headers = {
-    "Access-Control-Allow-Methods": "POST, OPTIONS, GET",
-    "Access-Control-Allow-Headers": "Content-Type, Cache-Control, Pragma",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": requestedHeaders || "Content-Type",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin"
   };
@@ -33,25 +33,39 @@ export default {
     const origin = request.headers.get("Origin") || "";
     const method = request.method;
 
-    console.log("PDF upload request", {
+    console.log("PDF Worker request received", {
       method,
       origin: origin || "(none)",
-      contentType: request.headers.get("Content-Type") || ""
+      contentType: request.headers.get("Content-Type") || "",
+      requestedMethod: request.headers.get("Access-Control-Request-Method") || "",
+      requestedHeaders: request.headers.get("Access-Control-Request-Headers") || ""
     });
 
     if (origin && !ALLOWED_ORIGINS.has(origin)) {
-      console.error("Rejected origin", { origin });
-      return jsonResponse(
-        { success: false, error: "Origin not allowed" },
-        403,
-        ""
-      );
+      console.error("Rejected origin", { origin, method });
+      return new Response("Origin not allowed", {
+        status: 403,
+        headers: { "Vary": "Origin" }
+      });
     }
 
     if (method === "OPTIONS") {
+      const requestedMethod =
+        request.headers.get("Access-Control-Request-Method") || "";
+      const requestedHeaders =
+        request.headers.get("Access-Control-Request-Headers") || "";
+
+      if (requestedMethod &&
+          !["GET", "POST"].includes(requestedMethod.toUpperCase())) {
+        return new Response("Method not allowed", {
+          status: 405,
+          headers: corsHeaders(origin, requestedHeaders)
+        });
+      }
+
       return new Response(null, {
         status: 204,
-        headers: corsHeaders(origin)
+        headers: corsHeaders(origin, requestedHeaders)
       });
     }
 
@@ -65,16 +79,13 @@ export default {
     if (method !== "POST") {
       return jsonResponse(
         { success: false, error: "Method not allowed" },
-        405,
-        origin
+        405, origin
       );
     }
 
     try {
-      if (
-        !env.CLOUDINARY_CLOUD_NAME ||
-        !env.CLOUDINARY_UPLOAD_PRESET
-      ) {
+      if (!env.CLOUDINARY_CLOUD_NAME ||
+          !env.CLOUDINARY_UPLOAD_PRESET) {
         throw new Error("Cloudinary configuration missing");
       }
 
@@ -85,10 +96,8 @@ export default {
         throw new Error("PDF file not found");
       }
 
-      if (
-        file.type !== "application/pdf" &&
-        !/\.pdf$/i.test(file.name || "")
-      ) {
+      if (file.type !== "application/pdf" &&
+          !/\.pdf$/i.test(file.name || "")) {
         throw new Error("Only PDF files are allowed");
       }
 
@@ -97,30 +106,20 @@ export default {
       }
 
       const uploadData = new FormData();
-      uploadData.append(
-        "file",
-        file,
-        file.name || "document.pdf"
-      );
-      uploadData.append(
-        "upload_preset",
-        env.CLOUDINARY_UPLOAD_PRESET
-      );
+      uploadData.append("file", file, file.name || "document.pdf");
+      uploadData.append("upload_preset", env.CLOUDINARY_UPLOAD_PRESET);
 
       const cloudinaryResponse = await fetch(
         `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/raw/upload`,
-        {
-          method: "POST",
-          body: uploadData
-        }
+        { method: "POST", body: uploadData }
       );
 
       const responseText = await cloudinaryResponse.text();
-
       let result = {};
+
       try {
         result = responseText ? JSON.parse(responseText) : {};
-      } catch {}
+      } catch (_) {}
 
       if (!cloudinaryResponse.ok || !result.secure_url) {
         throw new Error(
