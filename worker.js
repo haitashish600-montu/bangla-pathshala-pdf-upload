@@ -1,10 +1,15 @@
+// Bangla Pathshala PDF Upload Worker
+// PDF upload through Cloudinary. Push Worker is separate.
+
+const ALLOWED_ORIGIN = "https://haitashish600-montu.github.io";
 
 function corsHeaders() {
   return {
-    "Access-Control-Allow-Origin": "https://haitashish600-montu.github.io",
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
-    "Access-Control-Max-Age": "86400"
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin"
   };
 }
 
@@ -13,33 +18,26 @@ function jsonResponse(data, status = 200) {
     status,
     headers: {
       ...corsHeaders(),
-      "Content-Type": "application/json"
+      "Content-Type": "application/json; charset=utf-8"
     }
   });
 }
 
-function formResponse(data, requestId) {
-  const message = {
-    type: "BP_PDF_UPLOAD_RESULT",
-    requestId,
-    ...data
-  };
+function formResultResponse(data, status = 200) {
+  const safe = JSON.stringify(data).replace(/</g, "\\u003c");
 
   const html = `<!doctype html>
-<html>
-<head><meta charset="utf-8"></head>
-<body>
-<script>
-window.parent.postMessage(
-  ${JSON.stringify(message)},
-  "https://haitashish600-montu.github.io"
-);
-</script>
-</body>
-</html>`;
+  <html>
+  <head><meta charset="utf-8"></head>
+  <body>
+  <script>
+    parent.postMessage(${safe}, ${JSON.stringify(ALLOWED_ORIGIN)});
+  </script>
+  </body>
+  </html>`;
 
   return new Response(html, {
-    status: 200,
+    status,
     headers: {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "no-store",
@@ -51,49 +49,59 @@ window.parent.postMessage(
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const isFormUpload = url.searchParams.get("bp_form_upload") === "1";
+    const method = request.method;
+    const formMode = url.searchParams.get("bp_form_upload") === "1";
     const requestId = url.searchParams.get("request_id") || "";
+    const origin = request.headers.get("Origin") || "";
 
-    const respond = (data, status = 200) => {
-      return isFormUpload
-        ? formResponse(data, requestId)
-        : jsonResponse(data, status);
-    };
+    console.log("PDF upload request", {
+      method,
+      formMode,
+      origin,
+      contentType: request.headers.get("Content-Type") || ""
+    });
 
-    if (request.method === "OPTIONS") {
+    if (method === "OPTIONS") {
       return new Response(null, {
         status: 204,
         headers: corsHeaders()
       });
     }
 
-    if (request.method === "GET") {
+    if (method === "GET") {
       return jsonResponse({
         success: true,
         message: "Bangla Pathshala PDF Upload Worker is ready"
       });
     }
 
-    if (request.method !== "POST") {
-      return respond({
+    if (method !== "POST") {
+      const error = {
+        type: "BP_PDF_UPLOAD_RESULT",
+        requestId,
         success: false,
         error: "Method not allowed"
-      }, 405);
+      };
+
+      return formMode
+        ? formResultResponse(error, 405)
+        : jsonResponse(error, 405);
     }
 
     try {
-      if (
-        !env.CLOUDINARY_CLOUD_NAME ||
-        !env.CLOUDINARY_UPLOAD_PRESET
-      ) {
+      if (origin && origin !== ALLOWED_ORIGIN) {
+        throw new Error("Origin not allowed");
+      }
+
+      if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_UPLOAD_PRESET) {
         throw new Error("Cloudinary configuration missing");
       }
 
-      const form = await request.formData();
-      const file = form.get("file");
+      const incoming = await request.formData();
+      const file = incoming.get("file");
 
       if (!file || typeof file === "string") {
-        throw new Error("PDF file not found in form field 'file'");
+        throw new Error("PDF file not found");
       }
 
       if (
@@ -120,8 +128,8 @@ export default {
       );
 
       const raw = await cloudinaryResponse.text();
-      let result = {};
 
+      let result = {};
       try {
         result = raw ? JSON.parse(raw) : {};
       } catch (_) {}
@@ -129,22 +137,47 @@ export default {
       if (!cloudinaryResponse.ok || !result.secure_url) {
         throw new Error(
           result.error?.message ||
-          `Cloudinary upload failed (HTTP ${cloudinaryResponse.status})`
+          `Cloudinary upload failed: HTTP ${cloudinaryResponse.status}`
         );
       }
 
-      return respond({
-        success: true,
-        url: result.secure_url,
-        public_id: result.public_id,
-        message: "PDF uploaded successfully"
+      console.log("PDF uploaded successfully", {
+        publicId: result.public_id || "",
+        size: file.size
       });
 
+      const success = {
+        type: "BP_PDF_UPLOAD_RESULT",
+        requestId,
+        success: true,
+        url: result.secure_url,
+        public_id: result.public_id || ""
+      };
+
+      return formMode
+        ? formResultResponse(success)
+        : jsonResponse({
+            success: true,
+            url: result.secure_url,
+            public_id: result.public_id || "",
+            message: "PDF uploaded successfully"
+          });
+
     } catch (error) {
-      return respond({
+      const message = error?.message || "PDF upload failed";
+
+      console.error("PDF upload failed:", message);
+
+      const failure = {
+        type: "BP_PDF_UPLOAD_RESULT",
+        requestId,
         success: false,
-        error: error?.message || "PDF upload failed"
-      }, 400);
+        error: message
+      };
+
+      return formMode
+        ? formResultResponse(failure, 400)
+        : jsonResponse(failure, 400);
     }
   }
 };
